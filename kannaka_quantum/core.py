@@ -394,17 +394,23 @@ def _qbraid_quote(device: str, shots: int) -> dict[str, Any] | None:
     """
     try:
         from qbraid_core.services.runtime import QuantumRuntimeClient  # type: ignore
-    except Exception:
+    except ImportError:
+        # qbraid-core absent, or older than 0.6.4 where estimate_cost landed.
         return None
     try:
         quote = QuantumRuntimeClient().estimate_cost(device, shots=int(shots))
-    except Exception:
+    except Exception:  # noqa: BLE001 - deliberate: see below
+        # Every failure mode of a third-party network client — auth, transport,
+        # a schema change, a raise where a flag was promised — must read as
+        # "price unknown" so the caller refuses. Narrowing this would let an
+        # unanticipated error escape and abort the run, or worse, be caught
+        # upstream and treated as free. Unknown is the safe answer here.
         return None
     if not getattr(quote, "pricingAvailable", False):
         return {"unavailable_reason": str(getattr(quote, "reason", "") or "no reason given")}
     try:
-        return {"est_credits": float(getattr(quote, "estimatedCost"))}
-    except (TypeError, ValueError):
+        return {"est_credits": float(quote.estimatedCost)}
+    except (AttributeError, TypeError, ValueError):
         return None
 
 

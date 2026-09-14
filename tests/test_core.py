@@ -3,9 +3,9 @@ state-vector, so CI doesn't need a qBraid account). The end-to-end execution
 path is exercised against the live free simulator by hand / the demo.
 """
 
-import numpy as np
 import sys
 
+import numpy as np
 import pytest
 
 from kannaka_quantum import core
