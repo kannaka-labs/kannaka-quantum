@@ -364,6 +364,56 @@ def _counts_from_result(res: Any) -> dict[str, int]:
     return {}
 
 
+def _qbraid_quote(device: str, shots: int) -> dict[str, Any] | None:
+    """Ask qBraid what a job would cost, for devices whose metadata carries no
+    pricing.
+
+    ``dev.metadata()["pricing"]`` is empty for some real QPUs — the direct
+    Rigetti path among them — and multiplying absent per-shot prices gives
+    0.0 credits, which sails under any ceiling. qbraid-core 0.6.4 added a
+    server-side estimate that aggregates the device's execution history, so
+    ask it rather than guess.
+
+    Returns None whenever no usable number comes back: the package is too old
+    or absent, the call fails, or the device simply cannot be quoted. The
+    caller must treat None as "unknown", never as "free".
+
+    Two details from qBraid, both load-bearing:
+
+    * A device that cannot be quoted returns ``pricingAvailable=False`` with a
+      ``reason`` — it does NOT raise. Branch on the flag, or an unquotable
+      device looks like a successful quote of whatever ``estimatedCost``
+      happens to hold.
+    * Omitting ``shots`` quotes 1000 rather than quoting shot-independently,
+      so it is always passed explicitly here.
+
+    The estimate is deliberately biased high (aggregated with a buffer; about
+    95% of jobs land under it) and nothing enforces it, so it is a working
+    ceiling rather than a guarantee. A deep or dense circuit can still exceed
+    it.
+    """
+    try:
+        from qbraid_core.services.runtime import QuantumRuntimeClient  # type: ignore
+    except ImportError:
+        # qbraid-core absent, or older than 0.6.4 where estimate_cost landed.
+        return None
+    try:
+        quote = QuantumRuntimeClient().estimate_cost(device, shots=int(shots))
+    except Exception:  # noqa: BLE001 - deliberate: see below
+        # Every failure mode of a third-party network client — auth, transport,
+        # a schema change, a raise where a flag was promised — must read as
+        # "price unknown" so the caller refuses. Narrowing this would let an
+        # unanticipated error escape and abort the run, or worse, be caught
+        # upstream and treated as free. Unknown is the safe answer here.
+        return None
+    if not getattr(quote, "pricingAvailable", False):
+        return {"unavailable_reason": str(getattr(quote, "reason", "") or "no reason given")}
+    try:
+        return {"est_credits": float(quote.estimatedCost)}
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
 def _qbraid_spend_guard(
     pricing: dict, device: str, shots: int, allow_spend: bool, max_credits: float | None,
     max_seconds: float | None = None,
@@ -414,6 +464,43 @@ def _qbraid_spend_guard(
             "ceiling_usd": round(ceiling * QBRAID_USD_PER_CREDIT, 4),
             "note": "billed for actual execution time, prorated; the ceiling is the accepted bound, not the expected cost",
         }
+    if per_task == 0.0 and per_shot == 0.0:
+        # No pricing metadata at all. The arithmetic below would make this
+        # 0.0 credits and wave a real QPU through under any ceiling — the same
+        # "unknown price" case _oq_estimate_cost refuses outright. Ask qBraid
+        # for a server-side quote first; only an explicitly accepted ceiling
+        # gets past an unquotable device.
+        quoted = _qbraid_quote(device, int(shots))
+        if quoted is not None and "est_credits" in quoted:
+            est_credits = quoted["est_credits"]
+            est_usd = est_credits * QBRAID_USD_PER_CREDIT
+            if est_credits > cap:
+                raise RuntimeError(
+                    f"qBraid estimates {est_credits:.2f} credits (${est_usd:.2f}) for {shots} shots on "
+                    f"{device}, over the {cap}-credit cap — lower shots or raise max_credits."
+                )
+            return {
+                "source": "qbraid.estimate_cost",
+                "est_credits": round(est_credits, 3),
+                "est_usd": round(est_usd, 4),
+                "note": (
+                    "server-side estimate, biased high (~95% of jobs land under) and NOT enforced by "
+                    "qBraid — a working ceiling, not a guarantee"
+                ),
+            }
+        if max_credits is None:
+            why = (quoted or {}).get("unavailable_reason", "no pricing in device metadata and no quote available")
+            raise RuntimeError(
+                f"cannot price '{device}': {why}. Refusing rather than assuming free — pass "
+                f"max_credits=<credits> (CLI: --max-credits) to accept a ceiling you choose."
+            )
+        return {
+            "source": "operator-accepted",
+            "est_credits": None,
+            "cap_credits": cap,
+            "note": "price unknown; the caller accepted an explicit ceiling instead",
+        }
+
     est_credits = per_task + per_shot * int(shots)
     est_usd = est_credits * QBRAID_USD_PER_CREDIT
     if est_credits > cap:

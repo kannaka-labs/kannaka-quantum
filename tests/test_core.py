@@ -3,6 +3,8 @@ state-vector, so CI doesn't need a qBraid account). The end-to-end execution
 path is exercised against the live free simulator by hand / the demo.
 """
 
+import sys
+
 import numpy as np
 import pytest
 
@@ -173,6 +175,105 @@ def test_qbraid_spend_guard_allows_with_opt_in(monkeypatch):
         {"perTask": 1.0, "perShot": 0.1}, "aws:ionq:qpu:forte-1", 10, allow_spend=True, max_credits=200.0
     )
     assert est["est_credits"] == 2.0  # 1 + 0.1*10
+
+
+# --- an unpriced device is unknown, never free ------------------------------ #
+
+
+class _Quote:
+    """Stands in for qbraid_core's estimate_cost result."""
+
+    def __init__(self, available, cost=None, reason=""):
+        self.pricingAvailable = available
+        self.estimatedCost = cost
+        self.reason = reason
+
+
+def test_qbraid_spend_guard_refuses_a_device_it_cannot_price(monkeypatch):
+    # The bug: dev.metadata()["pricing"] is empty for some real QPUs (the direct
+    # Rigetti path among them). per_task and per_shot are then 0.0, so
+    # est_credits = 0 + 0*shots = 0.0, which is under every ceiling — a real QPU
+    # waved through with a confident estimate of "free".
+    monkeypatch.setattr(core, "_qbraid_quote", lambda device, shots: None)
+    with pytest.raises(RuntimeError, match="cannot price"):
+        core._qbraid_spend_guard(
+            {}, "qbraid:rigetti:qpu:cepheus-1-108q", 1000, allow_spend=True, max_credits=None
+        )
+
+
+def test_qbraid_spend_guard_unpriced_device_never_reports_zero(monkeypatch):
+    # Guards the specific wrong ANSWER, not just the raise: if someone reinstates
+    # the arithmetic, this catches an estimate of 0.0 slipping through a cap.
+    monkeypatch.setattr(core, "_qbraid_quote", lambda device, shots: None)
+    est = core._qbraid_spend_guard(
+        {}, "qbraid:rigetti:qpu:cepheus-1-108q", 1000, allow_spend=True, max_credits=50.0
+    )
+    assert est["est_credits"] is None, "an unknown price must not be reported as a number"
+    assert est["est_credits"] != 0.0
+    assert est["cap_credits"] == 50.0
+    assert est["source"] == "operator-accepted"
+
+
+def test_qbraid_spend_guard_uses_the_server_quote_when_metadata_has_none(monkeypatch):
+    monkeypatch.setattr(core, "_qbraid_quote", lambda device, shots: {"est_credits": 12.0})
+    est = core._qbraid_spend_guard(
+        {}, "rigetti:rigetti:qpu:cepheus-1-108q", 1000, allow_spend=True, max_credits=50.0
+    )
+    assert est["source"] == "qbraid.estimate_cost"
+    assert est["est_credits"] == 12.0
+    # Said out loud, because qBraid does not enforce this number.
+    assert "not a guarantee" in est["note"]
+
+
+def test_qbraid_spend_guard_server_quote_still_respects_the_cap(monkeypatch):
+    # A quote is an estimate, not permission to spend.
+    monkeypatch.setattr(core, "_qbraid_quote", lambda device, shots: {"est_credits": 900.0})
+    with pytest.raises(RuntimeError, match="over the .* cap"):
+        core._qbraid_spend_guard(
+            {}, "rigetti:rigetti:qpu:cepheus-1-108q", 1000, allow_spend=True, max_credits=50.0
+        )
+
+
+def test_qbraid_spend_guard_surfaces_why_a_device_could_not_be_quoted(monkeypatch):
+    monkeypatch.setattr(
+        core, "_qbraid_quote", lambda device, shots: {"unavailable_reason": "device is offline"}
+    )
+    with pytest.raises(RuntimeError, match="device is offline"):
+        core._qbraid_spend_guard(
+            {}, "rigetti:rigetti:qpu:cepheus-1-108q", 1000, allow_spend=True, max_credits=None
+        )
+
+
+def test_qbraid_quote_branches_on_pricing_available(monkeypatch):
+    # qBraid returns pricingAvailable=False with a reason rather than raising, so
+    # a bridge that ignores the flag reads whatever estimatedCost happens to hold
+    # as a successful quote. Here that would be 0.0 — free, again.
+    import types
+
+    mod = types.ModuleType("qbraid_core.services.runtime")
+    captured = {}
+
+    class Client:
+        def estimate_cost(self, device, shots=None):
+            captured["device"] = device
+            captured["shots"] = shots
+            return _Quote(False, cost=0.0, reason="no pricing for this device")
+
+    mod.QuantumRuntimeClient = Client
+    monkeypatch.setitem(sys.modules, "qbraid_core.services.runtime", mod)
+
+    got = core._qbraid_quote("rigetti:rigetti:qpu:cepheus-1-108q", 250)
+    assert got == {"unavailable_reason": "no pricing for this device"}
+    assert "est_credits" not in got
+    # shots is passed explicitly: omitting it quotes 1000 rather than quoting
+    # shot-independently, which would silently misprice every other shot count.
+    assert captured["shots"] == 250
+
+
+def test_qbraid_quote_returns_none_when_the_package_is_absent(monkeypatch):
+    # Old or missing qbraid-core must read as "unknown", so the caller refuses.
+    monkeypatch.setitem(sys.modules, "qbraid_core.services.runtime", None)
+    assert core._qbraid_quote("rigetti:rigetti:qpu:cepheus-1-108q", 100) is None
 
 
 # --- free-simulator default holds (no spend guard, no opt-in required) ------ #
