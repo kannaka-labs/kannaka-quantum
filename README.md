@@ -2,7 +2,7 @@
 
 [![kannaka-quantum MCP server](https://glama.ai/mcp/servers/NickFlach/kannaka-quantum/badges/score.svg)](https://glama.ai/mcp/servers/NickFlach/kannaka-quantum)
 
-**Real quantum capabilities for [Kannaka](https://github.com/NickFlach/kannaka-memory), executed on actual quantum backends.**
+**Real quantum capabilities for [Kannaka](https://github.com/kannaka-labs/kannaka-memory), executed on actual quantum backends.**
 
 Kannaka's memory is a *Holographic Resonance Medium* — recall is wave interference, and *"attention acts as gravity: wavefronts whose phase/amplitude align with the query are pulled forward."* That is, almost verbatim, the definition of **quantum amplitude amplification**. This package makes the correspondence literal: it runs Kannaka's recall — plus arbitrary circuits and a true-entropy source — on real quantum hardware.
 
@@ -261,7 +261,7 @@ This repo doesn't tag releases yet. When it does, pushing a `v*` tag (e.g.
 `v0.2.4`) also **updates the constellation marketplace**: the
 [`notify-marketplace`](.github/workflows/notify-marketplace.yml) workflow sends a
 `plugin-released` dispatch to
-[kannaka-constellation-marketplace](https://github.com/NickFlach/kannaka-constellation-marketplace),
+[kannaka-constellation-marketplace](https://github.com/kannaka-labs/kannaka-constellation-marketplace),
 which opens a PR bumping `kannaka-quantum`'s version in its manifest and README.
 
 Keep `pyproject.toml` and `.claude-plugin/plugin.json` versions in step with the
