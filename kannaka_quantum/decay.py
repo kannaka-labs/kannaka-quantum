@@ -26,7 +26,7 @@ from __future__ import annotations
 import json
 import math
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from itertools import pairwise
 from pathlib import Path
 from typing import Any
@@ -195,6 +195,39 @@ def run_decay(
                   status=stopped or "complete")
     say(f"done: {len(jobs)} jobs, {spent:.2f} credits (${spent / 100:.2f}); {record['status']}")
     return record
+
+
+def rank_qubits(
+    runner: Runner,
+    qubits: Sequence[int],
+    delay_us: float = 20.0,
+    shots: int = 300,
+    arm: str = "t1",
+    log: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """Calibration-aware qubit choice: run one ``arm`` point at ``delay_us`` on
+    each candidate qubit and rank them by retained P(1). The best qubits that
+    day go to ``quantum_recall(layout=…)``. One job per qubit; on the native
+    Rigetti route each is tens of milliseconds, cents apiece.
+
+    This is the poor man's version of learned calibration (Google's RL
+    calibration of Willow from syndrome data, Nature 2026): not a model, a
+    measurement taken right before the run it informs, and recorded with it.
+    """
+    say = log or (lambda _m: None)
+    rows = []
+    for q in qubits:
+        out = runner(program(arm, delay_us * 1e-6, int(q)), shots)
+        counts = out.get("counts") or {}
+        p = p_one(counts)
+        billed = out.get("billed") or {}
+        rows.append({"qubit": int(q), "p1": p, "se": se(p, shots), "credits": float(billed.get("cost") or 0.0),
+                     "job_id": out.get("job_id")})
+        say(f"qubit {q:3d}  P(1) at {delay_us:g} us = {p:.3f} ± {rows[-1]['se']:.3f}")
+    ranked = sorted(rows, key=lambda r: r["p1"], reverse=True)
+    return {"protocol": "calibrate", "arm": arm, "delay_us": delay_us, "shots": shots,
+            "ranked": ranked, "best": [r["qubit"] for r in ranked],
+            "credits_total": round(sum(r["credits"] for r in rows), 4)}
 
 
 def ledger_row(record: dict[str, Any], device: str, row_no: str = "n") -> str:

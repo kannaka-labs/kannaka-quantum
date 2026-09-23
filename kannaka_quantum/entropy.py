@@ -26,6 +26,7 @@ import hmac
 import json
 import os
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -230,12 +231,26 @@ class HmacDrbg:
 # --------------------------------------------------------------------------- #
 # Public operations
 # --------------------------------------------------------------------------- #
+#: Shots per CHSH setting for a harvest's Bell certificate. 256 × 4 settings is
+#: the cheapest run that still separates S from the classical bound at the
+#: fidelities the ledger has seen (row 2: 2.238 ± 0.073 at 512 shots).
+DEFAULT_CERTIFY_SHOTS = 256
+
+#: Names the Bell parameter a harvest must clear. The classical bound is 2; a
+#: device that cannot beat it that day is, for the reservoir's purposes, a
+#: classical noise source, and its bits are refused as quantum provenance.
+CERTIFY_BOUND = 2.0
+
+
 def harvest(
     n_bits: int = DEFAULT_HARVEST_BITS,
     device: str = DEFAULT_HARVEST_DEVICE,
     allow_spend: bool = False,
     max_credits: float | None = None,
     subcategory: str | None = None,
+    certify: bool = True,
+    certify_shots: int = DEFAULT_CERTIFY_SHOTS,
+    chsh_fn: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Run ``qrng`` on a REAL QPU and append the raw bits to the reservoir.
 
@@ -243,6 +258,15 @@ def harvest(
     ``core.qrng`` routes an ``openquantum:`` device through the same pre-flight
     cost gate (``--allow-spend`` / ``--max-credits``), so a no-opt-in or over-cap
     harvest raises before any job is submitted.
+
+    With ``certify`` (the default) a CHSH test runs on the same device first
+    and its Bell parameter goes into the harvest's provenance line. This is
+    the design Quantum Origin uses — a Bell-test seed feeding an extractor — at
+    the price of four short jobs. A device that does not violate the classical
+    bound that day (``S <= 2``) is refused: the reservoir's claim is that its
+    bits come from a non-classical process, and a certificate that cannot say
+    so is not a certificate. ``--no-certify`` keeps the old behaviour and the
+    meta line records ``bell: null`` so a reader can tell the two apart.
     """
     if "sim" in device.lower():
         raise RuntimeError(
@@ -250,6 +274,32 @@ def harvest(
             "Harvest from a real per-shot QPU, e.g. "
             f"{DEFAULT_HARVEST_DEVICE} (~$0.000255/shot) or openquantum:iqm:garnet."
         )
+
+    bell: dict[str, Any] | None = None
+    if certify:
+        run_chsh = chsh_fn or _default_chsh
+        cert = run_chsh(
+            device=device,
+            shots=certify_shots,
+            allow_spend=allow_spend,
+            max_credits=max_credits,
+            subcategory=subcategory,
+        )
+        bell = {
+            "S": cert.get("S"),
+            "abs_S": cert.get("abs_S"),
+            "shots_per_setting": certify_shots,
+            "violates_classical": bool(cert.get("violates_classical")),
+            "job_ids": cert.get("job_ids"),
+        }
+        if not bell["violates_classical"]:
+            raise RuntimeError(
+                f"Bell certificate failed on {device}: |S| = {bell['abs_S']} does not exceed the "
+                f"classical bound {CERTIFY_BOUND}. Not harvesting: the device did not behave "
+                "non-classically in this sitting, so its bits cannot carry quantum provenance. "
+                "Retry later, choose another device, or pass --no-certify to record an "
+                "uncertified harvest."
+            )
 
     result = core.qrng(
         n_bits, device=device, allow_spend=allow_spend, max_credits=max_credits, subcategory=subcategory
@@ -268,6 +318,7 @@ def harvest(
         "bytes": len(raw),
         "timestamp": _now_iso(),
         "cost_usd": _harvest_cost_usd(device, result["n_bits"]),
+        "bell": bell,
     }
     with open(_meta_path(), "a", encoding="utf-8") as f:
         f.write(json.dumps(entry) + "\n")
@@ -279,8 +330,15 @@ def harvest(
         "bits_harvested": result["n_bits"],
         "bytes_added": len(raw),
         "cost_usd": entry["cost_usd"],
+        "bell": bell,
         "reservoir_available_bytes": _available_bytes(),
     }
+
+
+def _default_chsh(**kwargs: Any) -> dict[str, Any]:
+    from . import bell as _bell  # local import: bell imports core, entropy must not at load
+
+    return _bell.chsh(**kwargs)
 
 
 def status() -> dict[str, Any]:

@@ -23,6 +23,7 @@ It is a **multi-provider bridge** with **two surfaces over one core**:
 | `harvest` | Harvest raw bits from a **real** QPU into a local entropy reservoir (the free simulator is a PRNG and is refused). Spend-guarded. |
 | `qrng-status` | Reservoir level, last-harvest provenance, and estimated refill cost. |
 | `qrng-draw` | Draw bits from the reservoir — raw, or (`--expand`) seed a NIST SP 800-90A **HMAC-DRBG** and expand. Every draw carries a provenance chain back to a QPU `job_id`; an empty reservoir fails loudly (no silent PRNG fallback). |
+| `calibrate` | Rank candidate qubits by retained P(1) after a delay on the native Rigetti route, so `bench --layout` runs on the best ones that day. |
 | `resonance_recall` / `recall` | **The showcase.** Amplitude-encode candidate memory resonances into a quantum state and amplitude-amplify toward the strongest — Kannaka's recall, run as interference on a quantum computer. |
 
 ---
@@ -117,7 +118,7 @@ kannaka-quantum qrng-draw --bits 256 --expand               # HMAC-DRBG stream s
 
 ### Entropy reservoir
 
-`harvest` runs `qrng` against a **real per-shot QPU** (default `openquantum:rigetti:cepheus-1-108q`, ~$0.000255/shot) and appends the raw bits to `~/.kannaka/entropy/reservoir.bin`, with a provenance line (`device`, `job_id`, `n_bits`, `cost_usd`, timestamp) in `reservoir.meta.jsonl`. The free simulator is a PRNG and is refused. `qrng-draw` returns raw reservoir bits, or with `--expand` seeds a NIST SP 800-90A HMAC-DRBG (stdlib only) and expands — every draw records the harvest(s) that seeded it, so the stream chains back to a QPU `job_id`. An empty reservoir fails loudly; there is no silent software-PRNG fallback.
+`harvest` first runs a CHSH test on the device and records its Bell parameter `S` in the provenance line (a device that does not violate the classical bound that day is refused; `--no-certify` records `bell: null`), then runs `qrng` against a **real per-shot QPU** (default `openquantum:rigetti:cepheus-1-108q`, ~$0.000255/shot) and appends the raw bits to `~/.kannaka/entropy/reservoir.bin`, with a provenance line (`device`, `job_id`, `n_bits`, `cost_usd`, timestamp) in `reservoir.meta.jsonl`. The free simulator is a PRNG and is refused. `qrng-draw` returns raw reservoir bits, or with `--expand` seeds a NIST SP 800-90A HMAC-DRBG (stdlib only) and expands — every draw records the harvest(s) that seeded it, so the stream chains back to a QPU `job_id`. An empty reservoir fails loudly; there is no silent software-PRNG fallback.
 
 ### Example: resonance recall
 

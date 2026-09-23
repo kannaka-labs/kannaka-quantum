@@ -11,8 +11,17 @@ license = { file = "LICENSE" }
 requires-python = ">=3.10"
 keywords = ["quantum", "qbraid", "openquantum", "kannaka", "mcp", "agent", "qiskit", "compute", "lab"]
 dependencies = [
-    "qbraid>=0.9",
-    "qbraid-core>=0.3",
+    # qBraid's unreleased 0.13 flips measurement bitstrings to little-endian across
+    # providers (CHANGELOG "Unreleased", 2026-09). core._measured_index encodes the
+    # per-device convention this bridge verified on real devices; under 0.13 the
+    # entropy harvest and the recall argmax would silently invert. Ceiling until that
+    # is audited; the bench's bit-order canary is the tripwire.
+    "qbraid>=0.12,<0.13",
+    # The core line qbraid 0.12.x resolves (it requires <0.4). The server-side cost
+    # estimate `_qbraid_quote` asks for lives in qbraid-core 0.6.x, which arrives
+    # with qbraid 0.13 and its bit-order flip: the two upgrade together, behind the
+    # canary. Until then the quote is absent and the guard treats that as unknown.
+    "qbraid-core>=0.3.3,<0.4",
     "qiskit>=1.0",
     "numpy>=1.23",
     "mcp>=1.0",

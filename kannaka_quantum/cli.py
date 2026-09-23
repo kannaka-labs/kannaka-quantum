@@ -9,6 +9,8 @@ import argparse
 import json
 import sys
 
+import numpy as np
+
 from . import bell, bench, core, entropy, lab, qubo
 
 
@@ -105,7 +107,23 @@ def build_parser() -> argparse.ArgumentParser:
     hv.add_argument("--bits", type=int, default=entropy.DEFAULT_HARVEST_BITS)
     hv.add_argument("--device", default=entropy.DEFAULT_HARVEST_DEVICE,
                     help="real per-shot QPU (simulator refused). Default: " + entropy.DEFAULT_HARVEST_DEVICE)
+    hv.add_argument("--no-certify", action="store_true",
+                    help="skip the CHSH Bell certificate (default: run it first; a device that does not "
+                         "violate the classical bound that day is refused as an entropy source)")
+    hv.add_argument("--certify-shots", type=int, default=entropy.DEFAULT_CERTIFY_SHOTS,
+                    help="shots per CHSH setting for the certificate")
     _add_spend_opts(hv)
+
+    cb = sub.add_parser("calibrate", help="rank candidate qubits by retained P(1) after a delay (native Rigetti route), "
+                                          "so bench --layout can use the best ones that day")
+    cb.add_argument("--device", default="rigetti:rigetti:qpu:cepheus-1-108q")
+    cb.add_argument("--qubits", default="0,1,2,3,4,5,6,7", help="comma list of candidate physical qubits")
+    cb.add_argument("--delay-us", type=float, default=20.0)
+    cb.add_argument("--shots", type=int, default=300)
+    cb.add_argument("--arm", default="t1", choices=("t1", "ramsey", "echo"))
+    cb.add_argument("--allow-spend", action="store_true")
+    cb.add_argument("--max-credits", type=float, default=400.0, help="per-job credit cap on the per-minute device")
+    cb.add_argument("--max-seconds", type=float, default=2.0)
 
     sub.add_parser("qrng-status", help="entropy reservoir level, provenance, refill cost")
 
@@ -149,6 +167,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="write this run as the baseline (to --baseline) and skip the gate",
     )
+    bn.add_argument("--no-canary", action="store_true",
+                    help="skip the bit-order canary (default: run it first; a failed canary fails the bench)")
+    bn.add_argument("--layout", default=None,
+                    help="comma list of physical qubits to place each recall circuit on (from `calibrate`)")
+    bn.add_argument("--mitigate-readout", action="store_true",
+                    help="run two calibration jobs (|0..0>, |1..1>) on the device first and apply tensored "
+                         "readout mitigation to every scenario's counts")
     _add_spend_opts(bn)
 
     qb = sub.add_parser(
@@ -545,6 +570,24 @@ def _dispatch_lab(args) -> dict | None:
     return None
 
 
+
+def _readout_calibration_jobs(n: int, *, device: str, shots: int, layout, allow_spend: bool,
+                              max_credits, subcategory) -> list[tuple[float, float]]:
+    """Two jobs, |0…0⟩ and |1…1⟩ on ``n`` qubits (placed on ``layout`` if given),
+    turned into a per-qubit readout confusion for ``core.mitigate_readout``."""
+    from qiskit import QuantumCircuit
+
+    def run(prep_ones: bool):
+        qc = QuantumCircuit(n, n)
+        if prep_ones:
+            qc.x(range(n))
+        qc.measure(range(n), range(n))
+        return core.run_qiskit(core.place_on(qc, layout), device=device, shots=shots, allow_spend=allow_spend,
+                               max_credits=max_credits, subcategory=subcategory)["counts"]
+
+    return core.readout_calibration(run(False), run(True))
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
@@ -604,7 +647,22 @@ def main(argv: list[str] | None = None) -> int:
                 allow_spend=args.allow_spend,
                 max_credits=args.max_credits,
                 subcategory=args.subcategory,
+                certify=not args.no_certify,
+                certify_shots=args.certify_shots,
             )
+        elif args.cmd == "calibrate":
+            from kannaka_quantum import decay as _decay
+
+            def _cal_runner(quil: str, shots: int):
+                return core.run_quil(quil, device=args.device, shots=shots, allow_spend=args.allow_spend,
+                                     max_credits=args.max_credits, max_seconds=args.max_seconds)
+
+            out = _decay.rank_qubits(
+                _cal_runner, [int(q) for q in args.qubits.split(",") if q.strip()],
+                delay_us=args.delay_us, shots=args.shots, arm=args.arm,
+                log=lambda m: print(f"[calibrate] {m}", file=sys.stderr, flush=True),
+            )
+            out["device"] = args.device
         elif args.cmd == "qrng-status":
             out = entropy.status()
         elif args.cmd == "qrng-draw":
@@ -659,6 +717,16 @@ def main(argv: list[str] | None = None) -> int:
         elif args.cmd == "bench":
             # Prints the result JSON like every other command, but the exit code
             # carries the regression verdict so CI can gate a PR on it.
+            layout = [int(q) for q in args.layout.split(",") if q.strip()] if args.layout else None
+            readout_cal = None
+            if args.mitigate_readout:
+                n_q = max(1, max((len(s.get("candidates", [])) for s in bench.load_corpus(args.scenarios)["scenarios"]),
+                                 default=1))
+                n_q = max(1, int(np.ceil(np.log2(n_q))))
+                readout_cal = _readout_calibration_jobs(
+                    n_q, device=args.device, shots=args.shots, layout=layout,
+                    allow_spend=args.allow_spend, max_credits=args.max_credits, subcategory=args.subcategory,
+                )
             result, code = bench.bench_command(
                 scenarios=args.scenarios,
                 device=args.device,
@@ -672,6 +740,9 @@ def main(argv: list[str] | None = None) -> int:
                 baseline=args.baseline,
                 regression_threshold=args.regression_threshold,
                 update_baseline=args.update_baseline,
+                canary=not args.no_canary,
+                layout=layout,
+                readout_cal=readout_cal,
             )
             print(json.dumps(result))
             return code
