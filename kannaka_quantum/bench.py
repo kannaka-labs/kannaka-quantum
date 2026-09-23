@@ -84,6 +84,8 @@ def run_bench(
     max_credits: float | None = None,
     subcategory: str | None = None,
     recall_fn: RecallFn | None = None,
+    layout: list[int] | None = None,
+    readout_cal: list[tuple[float, float]] | None = None,
 ) -> dict[str, Any]:
     """Run every scenario through recall and aggregate the agreement rate.
 
@@ -115,6 +117,11 @@ def run_bench(
             skipped += 1
             continue
 
+        extra: dict[str, Any] = {}
+        if layout is not None:
+            extra["layout"] = layout
+        if readout_cal is not None:
+            extra["readout_cal"] = readout_cal
         res = recall(
             amplitudes,
             labels=labels,
@@ -124,6 +131,7 @@ def run_bench(
             allow_spend=allow_spend,
             max_credits=max_credits,
             subcategory=subcategory,
+            **extra,
         )
         agree = bool(res.get("agree"))
         scored += 1
@@ -174,6 +182,8 @@ def run_bench(
         "agreements": agreements,
         "agreement_rate": agreement_rate,
         "argmax_mismatches": argmax_mismatches,
+        "layout": layout,
+        "readout_mitigated": readout_cal is not None,
         "scenarios": per_scenario,
     }
 
@@ -248,15 +258,27 @@ def bench_command(
     regression_threshold: float = DEFAULT_REGRESSION_POINTS,
     update_baseline: bool = False,
     recall_fn: RecallFn | None = None,
+    canary: bool = True,
+    canary_fn: Callable[..., dict[str, Any]] | None = None,
+    layout: list[int] | None = None,
+    readout_cal: list[tuple[float, float]] | None = None,
 ) -> tuple[dict[str, Any], int]:
     """Orchestrate a benchmark run for the CLI.
 
     Returns ``(result_document, exit_code)``. Exit code is 1 iff a baseline was
     given (and not being updated) and the run regressed past the threshold — so
-    the CI gate fails the PR. ``--update-baseline`` rewrites the baseline and
-    always passes.
+    the CI gate fails the PR — **or** the bit-order canary failed, which means
+    the device's bitstrings no longer decode the way the bridge assumes and
+    every agreement number after it would be wrong. ``--update-baseline``
+    rewrites the baseline and passes the regression gate, never the canary.
     """
     corpus = load_corpus(scenarios)
+    canary_result = None
+    if canary:
+        run_canary = canary_fn or core.bit_order_canary
+        canary_result = run_canary(
+            device=device, shots=shots, allow_spend=allow_spend, max_credits=max_credits, subcategory=subcategory
+        )
     result = run_bench(
         corpus,
         device=device,
@@ -267,10 +289,17 @@ def bench_command(
         max_credits=max_credits,
         subcategory=subcategory,
         recall_fn=recall_fn,
+        layout=layout,
+        readout_cal=readout_cal,
     )
+    result["bit_order_canary"] = canary_result
 
     if out:
         _write_json(out, result)
+
+    if canary_result is not None and not canary_result.get("ok"):
+        result["canary_failed"] = True
+        return result, 1
 
     if update_baseline:
         if not baseline:

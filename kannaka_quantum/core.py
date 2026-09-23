@@ -529,6 +529,156 @@ def _json_safe(v: Any) -> Any:
     return str(v)
 
 
+#: Braket enforces a per-circuit gate cap on IonQ devices since 2026-06-04: 2,000
+#: gates on demand (5,000 reserved). A job over it is rejected after the per-task
+#: fee is incurred, so it is refused here, before submission.
+IONQ_GATE_CAP = 2000
+
+_QASM_NON_GATE = ("OPENQASM", "include", "qubit", "bit", "qreg", "creg", "measure", "barrier", "//", "reset")
+
+
+def count_gates(qasm3: str) -> int:
+    """Count gate statements in an OpenQASM program: every non-empty statement
+    that is not a header, declaration, measurement, barrier, reset or comment."""
+    n = 0
+    for raw in qasm3.replace(";", ";\n").splitlines():
+        line = raw.strip()
+        if not line or line.startswith(_QASM_NON_GATE) or line in ("{", "}") or "measure" in line:
+            continue
+        n += 1
+    return n
+
+
+def _check_gate_cap(qasm3: str, device: str) -> None:
+    if "ionq" in device.lower():
+        n = count_gates(qasm3)
+        if n > IONQ_GATE_CAP:
+            raise RuntimeError(
+                f"circuit has {n} gates; IonQ devices reject more than {IONQ_GATE_CAP} per circuit "
+                "on demand (Braket, 2026-06-04). Not submitting: the per-task fee would be spent on a rejection."
+            )
+
+
+def place_on(qc, layout: Sequence[int] | None):
+    """Return ``qc`` placed on physical qubits ``layout`` (one per circuit qubit),
+    as a wider circuit whose other qubits are idle. With no layout, ``qc`` itself.
+
+    This is how a caller chooses *which* qubits a job runs on without a
+    coupling map: the emitted OpenQASM declares ``max(layout) + 1`` qubits and
+    only touches the chosen ones, so the device's index-based decoding is
+    unchanged (the classical register is still ``qc``'s own). Used by the
+    calibration-aware bench: ``calibrate`` ranks qubits by their measured
+    decay, and ``--layout`` puts the recall circuit on the best of them.
+    """
+    if layout is None:
+        return qc
+    from qiskit import QuantumCircuit
+
+    layout = [int(q) for q in layout]
+    if len(layout) != qc.num_qubits:
+        raise ValueError(f"layout has {len(layout)} qubits, circuit needs {qc.num_qubits}")
+    if len(set(layout)) != len(layout) or min(layout) < 0:
+        raise ValueError(f"layout must be distinct non-negative qubit indices, got {layout}")
+    wide = QuantumCircuit(max(layout) + 1, qc.num_clbits)
+    wide.compose(qc, qubits=layout, clbits=list(range(qc.num_clbits)), inplace=True)
+    return wide
+
+
+def readout_calibration(counts_zero: dict[str, int], counts_one: dict[str, int]) -> list[tuple[float, float]]:
+    """Per-qubit readout confusion from two calibration runs, |0…0⟩ and |1…1⟩,
+    in the device's own bitstring order (position i of the string is qubit
+    position i here, whatever the device's convention, so no reversal is ever
+    needed as long as the same device decodes the data).
+
+    Returns, per string position, ``(p(read 1 | prepared 0), p(read 0 | prepared 1))``.
+    Tensored: each qubit's readout error is taken as independent of the others,
+    which is the two-job calibration a per-task fee makes affordable (the full
+    2^n-state version costs 2^n tasks).
+    """
+    n = len(next(iter(counts_zero)))
+    z = sum(counts_zero.values())
+    o = sum(counts_one.values())
+    cal = []
+    for i in range(n):
+        e0 = sum(c for b, c in counts_zero.items() if b[i] == "1") / z if z else 0.0
+        e1 = sum(c for b, c in counts_one.items() if b[i] == "0") / o if o else 0.0
+        cal.append((e0, e1))
+    return cal
+
+
+def mitigate_readout(counts: dict[str, int], cal: list[tuple[float, float]]) -> dict[str, int]:
+    """Invert the tensored readout confusion on ``counts`` and return integer
+    counts summing to the original shots. Negative probabilities from the
+    inversion are clipped to zero before renormalising, the standard lossy
+    step; a perfect calibration (all errors 0) returns ``counts`` unchanged.
+    """
+    import numpy as _np
+
+    if not counts:
+        return counts
+    n = len(next(iter(counts)))
+    if len(cal) != n:
+        raise ValueError(f"calibration covers {len(cal)} qubits, counts have {n}")
+    shots = sum(counts.values())
+    # Per-qubit inverse confusion matrices M_i^-1 where M_i = [[1-e0, e1], [e0, 1-e1]]
+    invs = []
+    for e0, e1 in cal:
+        m = _np.array([[1.0 - e0, e1], [e0, 1.0 - e1]])
+        invs.append(_np.linalg.inv(m) if abs(_np.linalg.det(m)) > 1e-9 else _np.eye(2))
+    probs: dict[str, float] = {b: c / shots for b, c in counts.items()}
+    # Apply the tensor-product inverse one qubit at a time (sparse in the strings).
+    for i, inv in enumerate(invs):
+        nxt: dict[str, float] = {}
+        for b, p in probs.items():
+            for out_bit in (0, 1):
+                w = inv[out_bit, int(b[i])]
+                if w == 0.0:
+                    continue
+                nb = b[:i] + str(out_bit) + b[i + 1 :]
+                nxt[nb] = nxt.get(nb, 0.0) + p * w
+        probs = nxt
+    clipped = {b: max(0.0, p) for b, p in probs.items()}
+    total = sum(clipped.values()) or 1.0
+    out = {b: round(shots * p / total) for b, p in clipped.items() if p > 0}
+    return out
+
+
+#: The bit-order canary: 16 amplitudes over 4 qubits whose argmax is index 1
+#: (``0001``). Its bit reversal is index 8 (``1000``), a different, weak
+#: candidate, so a decoder that reads the wrong end of the string names the
+#: wrong memory and the bench fails. Any change in a provider's bitstring
+#: convention (qBraid 0.13 flips to little-endian) trips it.
+BIT_ORDER_CANARY = [0.05, 0.95, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.06, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05]
+BIT_ORDER_CANARY_TARGET = 1
+
+
+def bit_order_canary(
+    device: str = LOCAL_DEVICE,
+    shots: int = 512,
+    allow_spend: bool = False,
+    max_credits: float | None = None,
+    subcategory: str | None = None,
+) -> dict[str, Any]:
+    """Run the canary recall and say whether this device's bitstrings decode the
+    way the bridge assumes. ``ok`` is False when the amplified peak is read at
+    the bit-reversed index, which is what a flipped provider convention does."""
+    labels = [f"canary-{i:02d}" for i in range(len(BIT_ORDER_CANARY))]
+    res = quantum_recall(
+        BIT_ORDER_CANARY, labels=labels, shots=shots, amplify=True, device=device,
+        allow_spend=allow_spend, max_credits=max_credits, subcategory=subcategory,
+    )
+    expected = labels[BIT_ORDER_CANARY_TARGET]
+    reversed_idx = int(format(BIT_ORDER_CANARY_TARGET, "04b")[::-1], 2)
+    return {
+        "ok": res.get("quantum_top") == expected,
+        "expected": expected,
+        "got": res.get("quantum_top"),
+        "bit_reversed_would_be": labels[reversed_idx],
+        "device": device,
+        "job_id": res.get("job_id"),
+    }
+
+
 def run_qasm(
     qasm3: str,
     device: str = DEFAULT_DEVICE,
@@ -544,6 +694,7 @@ def run_qasm(
     ``device`` starts with ``openquantum:``; otherwise runs on qBraid (the free
     simulator by default).
     """
+    _check_gate_cap(qasm3, device)
     if device.startswith(OPENQUANTUM_PREFIX):
         return _run_openquantum(
             qasm3, device, shots, allow_spend=allow_spend, max_credits=max_credits, subcategory=subcategory
@@ -648,6 +799,12 @@ def _run_local_circuit(circuit, shots: int, device: str, seed: int = 1234) -> di
     basis index), which is exactly what :func:`_measured_index` parses for a
     non-``qbraid:`` device — so recall decodes a local run identically to a
     hosted one.
+
+    Counts are keyed by the **classical register**, as hosted devices key
+    theirs: a circuit placed on physical qubits (``place_on``) measures a few of
+    many, and the string has one bit per classical bit (leftmost = highest
+    clbit), never one per qubit. With no placement this is the old string
+    exactly.
     """
     from qiskit.quantum_info import Statevector
 
@@ -657,10 +814,22 @@ def _run_local_circuit(circuit, shots: int, device: str, seed: int = 1234) -> di
     total = probs.sum()
     probs = probs / total if total > 0 else np.full(len(probs), 1.0 / len(probs))
     n = base.num_qubits
+    # qubit → clbit for every final measurement; identity when none are declared.
+    pairs: list[tuple[int, int]] = []
+    for inst in circuit.data:
+        if inst.operation.name == "measure":
+            pairs.append((circuit.find_bit(inst.qubits[0]).index, circuit.find_bit(inst.clbits[0]).index))
+    n_cl = circuit.num_clbits if pairs else n
     rng = np.random.default_rng(seed)
     counts: dict[str, int] = {}
     for idx in rng.choice(len(probs), size=int(shots), p=probs):
-        bits = format(int(idx), f"0{n}b")
+        if pairs:
+            out = ["0"] * n_cl
+            for q, c in pairs:
+                out[n_cl - 1 - c] = str((int(idx) >> q) & 1)
+            bits = "".join(out)
+        else:
+            bits = format(int(idx), f"0{n}b")
         counts[bits] = counts.get(bits, 0) + 1
     return {"device": device, "shots": int(shots), "job_id": None, "counts": counts}
 
@@ -793,8 +962,14 @@ def quantum_recall(
     allow_spend: bool = False,
     max_credits: float | None = None,
     subcategory: str | None = None,
+    layout: Sequence[int] | None = None,
+    readout_cal: list[tuple[float, float]] | None = None,
 ) -> dict[str, Any]:
     """Perform Kannaka's resonance recall *as a quantum circuit*.
+
+    ``layout`` places the circuit on those physical qubits (see ``place_on``);
+    ``readout_cal`` applies tensored readout mitigation (``mitigate_readout``)
+    to the counts before decoding, and the result says so.
 
     The candidate memory resonances are amplitude-encoded into a quantum state
     ``|ψ⟩ = Σ (aᵢ/‖a‖)|i⟩`` (the query's interference pattern over the medium).
@@ -852,11 +1027,15 @@ def quantum_recall(
 
     qc.measure(range(n), range(n))
     out = run_qiskit(
-        qc, device=device, shots=shots, allow_spend=allow_spend, max_credits=max_credits, subcategory=subcategory
+        place_on(qc, layout), device=device, shots=shots, allow_spend=allow_spend,
+        max_credits=max_credits, subcategory=subcategory,
     )
+    counts = out["counts"]
+    if readout_cal is not None:
+        counts = mitigate_readout(counts, readout_cal)
 
     dist: dict[int, int] = {}
-    for bits, c in out["counts"].items():
+    for bits, c in counts.items():
         # Bitstring qubit-order is device-dependent (qBraid-native reverses,
         # AWS-routed does not) — see _measured_index.
         idx = _measured_index(bits, device)
@@ -881,6 +1060,8 @@ def quantum_recall(
         "device": device,
         "shots": shots,
         "job_id": out["job_id"],
+        "layout": list(layout) if layout is not None else None,
+        "readout_mitigated": readout_cal is not None,
     }
 
 

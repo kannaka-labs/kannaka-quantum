@@ -11,6 +11,7 @@ Five tracks, 21 issues, three waves. Repos: `kannaka-memory` (KM, private),
 **Wave 1 (ship first):** Track 1 complete + T2.1–T2.2 + T3.1 (the ADR)
 **Wave 2:** rest of Track 2, T3.2–T3.4, T4.1–T4.2
 **Wave 3:** T3.5, T4.3–T4.4, Track 5
+**Wave 4 (2026-09-22):** see `wave-4.md` — the bit-order canary, Bell-certified harvests, readout mitigation, calibration-aware benchmarking, the pre-registered Q4 hardware run.
 
 Standing budget for the whole wave: **< $5/quarter** of real-QPU spend
 (reservoir refills + one quarterly benchmark run), everything else on the free

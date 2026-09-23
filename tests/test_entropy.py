@@ -37,9 +37,21 @@ def _seed_reservoir(data: bytes, harvests):
 # ── T1.1: harvest ──────────────────────────────────────────────────────────
 
 
+def _fake_chsh(s_value: float = 2.4, calls: list | None = None):
+    """A bell.chsh stand-in: a certificate with Bell parameter ``s_value``."""
+
+    def run(**kwargs):
+        if calls is not None:
+            calls.append(kwargs)
+        return {"S": s_value, "abs_S": abs(s_value), "violates_classical": abs(s_value) > 2.0,
+                "job_ids": {"a0b0": "bell-1"}, "device": kwargs.get("device"), "shots": kwargs.get("shots")}
+
+    return run
+
+
 def test_harvest_appends_bits_and_meta(monkeypatch):
     monkeypatch.setattr(entropy.core, "qrng", _fake_qrng())
-    out = entropy.harvest(64, device="openquantum:rigetti:cepheus-1-108q", allow_spend=True)
+    out = entropy.harvest(64, device="openquantum:rigetti:cepheus-1-108q", allow_spend=True, chsh_fn=_fake_chsh())
     assert out["harvested"] is True
     assert out["bytes_added"] == 8  # 64 bits → 8 bytes
     assert out["job_id"] == "job-abc"
@@ -52,6 +64,38 @@ def test_harvest_appends_bits_and_meta(monkeypatch):
     assert meta[0]["n_bits"] == 64
     assert meta[0]["timestamp"]
     assert meta[0]["cost_usd"] is not None  # priced device
+    # The Bell certificate is in the provenance line and in the result.
+    assert meta[0]["bell"]["S"] == 2.4 and meta[0]["bell"]["violates_classical"] is True
+    assert out["bell"]["job_ids"] == {"a0b0": "bell-1"}
+
+
+def test_harvest_certificate_runs_first_on_the_same_device_and_a_classical_day_is_refused(monkeypatch):
+    order = []
+    calls: list = []
+
+    def qrng_spy(n_bits, device="d", allow_spend=False, max_credits=None, subcategory=None):
+        order.append("qrng")
+        bits = "1" * n_bits
+        return {"bits": bits, "n_bits": n_bits, "int": int(bits, 2), "device": device, "job_id": "j"}
+
+    monkeypatch.setattr(entropy.core, "qrng", qrng_spy)
+    # S = 1.9: the device did not beat the classical bound. Refused, nothing written, qrng never ran.
+    with pytest.raises(RuntimeError, match="Bell certificate failed"):
+        entropy.harvest(16, device="openquantum:iqm:garnet", allow_spend=True, max_credits=5.0,
+                        chsh_fn=_fake_chsh(1.9, calls))
+    assert order == [] and entropy._reservoir_total_bytes() == 0 and entropy._read_meta() == []
+    assert calls[0]["device"] == "openquantum:iqm:garnet" and calls[0]["allow_spend"] is True
+    assert calls[0]["max_credits"] == 5.0 and calls[0]["shots"] == entropy.DEFAULT_CERTIFY_SHOTS
+    # A violating certificate: it ran before the harvest, and the harvest happened.
+    entropy.harvest(16, device="openquantum:iqm:garnet", allow_spend=True, chsh_fn=_fake_chsh(2.3, calls))
+    assert order == ["qrng"] and entropy._reservoir_total_bytes() == 2
+
+
+def test_harvest_without_certificate_records_null_so_a_reader_can_tell(monkeypatch):
+    monkeypatch.setattr(entropy.core, "qrng", _fake_qrng())
+    out = entropy.harvest(64, device="openquantum:rigetti:cepheus-1-108q", allow_spend=True, certify=False)
+    assert out["bell"] is None
+    assert entropy._read_meta()[0]["bell"] is None
 
 
 def test_harvest_refuses_simulator(monkeypatch):
@@ -72,7 +116,7 @@ def test_harvest_forwards_spend_guard_args(monkeypatch):
         return {"bits": bits, "n_bits": n_bits, "int": int(bits, 2), "device": device, "job_id": "j"}
 
     monkeypatch.setattr(entropy.core, "qrng", spy)
-    entropy.harvest(16, device="openquantum:iqm:garnet", allow_spend=True, max_credits=3.0)
+    entropy.harvest(16, device="openquantum:iqm:garnet", allow_spend=True, max_credits=3.0, chsh_fn=_fake_chsh())
     assert seen == {"allow_spend": True, "max_credits": 3.0}
 
 
@@ -103,7 +147,7 @@ def test_status_empty_reservoir():
 
 def test_status_after_harvest(monkeypatch):
     monkeypatch.setattr(entropy.core, "qrng", _fake_qrng())
-    entropy.harvest(128, device="openquantum:iqm:garnet", allow_spend=True)
+    entropy.harvest(128, device="openquantum:iqm:garnet", allow_spend=True, chsh_fn=_fake_chsh())
     st = entropy.status()
     assert st["available_bytes"] == 16
     assert st["available_bits"] == 128
