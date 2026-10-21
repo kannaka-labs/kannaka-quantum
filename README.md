@@ -24,6 +24,7 @@ It is a **multi-provider bridge** with **two surfaces over one core**:
 | `qrng-status` | Reservoir level, last-harvest provenance, and estimated refill cost. |
 | `qrng-draw` | Draw bits from the reservoir — raw, or (`--expand`) seed a NIST SP 800-90A **HMAC-DRBG** and expand. Every draw carries a provenance chain back to a QPU `job_id`; an empty reservoir fails loudly (no silent PRNG fallback). |
 | `resonance_recall` / `recall` | **The showcase.** Amplitude-encode candidate memory resonances into a quantum state and amplitude-amplify toward the strongest — Kannaka's recall, run as interference on a quantum computer. |
+| `qae` | Amplitude estimation of a 1-D transport probability (uncollided transmission through a Cd slab) against Monte Carlo: canonical QAE and maximum-likelihood QAE ladders, error-vs-queries exponents, a pre-registered verdict. Local state-vector by default; any device string otherwise. |
 
 ---
 
