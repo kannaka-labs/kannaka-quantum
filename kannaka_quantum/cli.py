@@ -201,6 +201,23 @@ def build_parser() -> argparse.ArgumentParser:
     ph.add_argument("--bins", type=int, default=None, help="rounding precision: phase bins (default 8; fewer = coarser)")
     ph.add_argument("--seed", type=int, default=5, help="deterministic RNG seed")
 
+    qa = sub.add_parser(
+        "qae",
+        help="amplitude estimation of a slab transmission vs Monte Carlo (ks-quantum-transport-warmup)",
+    )
+    qa.add_argument("--arms", default="mc,mlae,canonical", help="CSV subset of mc,mlae,canonical")
+    qa.add_argument("--device", default=core.LOCAL_DEVICE, help=_DEVICE_HELP)
+    qa.add_argument("--shots", type=int, default=50, help="shots per ladder rung (default 50)")
+    qa.add_argument("--seeds", default=None, help="CSV of seeds (default 0..9)")
+    qa.add_argument("--ks", default=None, help="CSV MLAE k ladder (default 0,1,2,4,8,16,32,64)")
+    qa.add_argument("--ms", default=None, help="CSV canonical counting-qubit ladder (default 1..8)")
+    qa.add_argument("--mc-ns", default=None, help="CSV Monte Carlo sample sizes (default 10..100000)")
+    qa.add_argument("--sigma-t", type=float, default=None, help="Sigma_t in 1/cm (default natural Cd, 117.1)")
+    qa.add_argument("--x-cm", type=float, default=None, help="slab thickness in cm (default 0.0100)")
+    qa.add_argument("--segments", type=int, default=3, help="qubits = slab segments (default 3)")
+    qa.add_argument("--out", default=None, help="write the JSON record here (default: stdout only)")
+    _add_spend_opts(qa)
+
     # --- qBraid Lab / infrastructure ---------------------------------------
     sub.add_parser("lab-credits", help="show qBraid credit balance")
 
@@ -703,6 +720,28 @@ def main(argv: list[str] | None = None) -> int:
                 max_credits=args.max_credits,
                 subcategory=args.subcategory,
             )
+        elif args.cmd == "qae":
+            from . import qae as _qae
+
+            _ints = lambda s: [int(x) for x in s.split(",")] if s else None
+            out = _qae.run_qae(
+                arms=tuple(a.strip() for a in args.arms.split(",") if a.strip()),
+                device=args.device,
+                seeds=_ints(args.seeds),
+                shots=args.shots,
+                mc_ns=_ints(args.mc_ns),
+                ks=_ints(args.ks),
+                ms=_ints(args.ms),
+                sigma_t_per_cm=args.sigma_t if args.sigma_t is not None else _qae.CD_SIGMA_T_PER_CM,
+                x_cm=args.x_cm if args.x_cm is not None else _qae.CD_SLAB_X_CM,
+                segments=args.segments,
+                allow_spend=args.allow_spend,
+                max_credits=args.max_credits,
+                log=lambda m: print(f"[qae] {m}", file=sys.stderr, flush=True),
+            )
+            if args.out:
+                _P(args.out).parent.mkdir(parents=True, exist_ok=True)
+                _P(args.out).write_text(_qae.to_json(out), encoding="utf-8")
         elif args.cmd == "phantom":
             from . import phantom
 
