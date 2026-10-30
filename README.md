@@ -1,6 +1,6 @@
 # kannaka-quantum
 
-[![kannaka-quantum MCP server](https://glama.ai/mcp/servers/NickFlach/kannaka-quantum/badges/score.svg)](https://glama.ai/mcp/servers/NickFlach/kannaka-quantum)
+[![kannaka-quantum MCP server](https://glama.ai/mcp/servers/kannaka-labs/kannaka-quantum/badges/score.svg)](https://glama.ai/mcp/servers/kannaka-labs/kannaka-quantum)
 
 **Real quantum capabilities for [Kannaka](https://github.com/kannaka-labs/kannaka-memory), executed on actual quantum backends.**
 
