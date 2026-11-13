@@ -38,7 +38,7 @@ TESTBED_ENV_PACKAGES = {
 }
 
 #: Default release repo the binary is pulled from (mirrors install.sh).
-DEFAULT_RELEASE_REPO = "NickFlach/kannaka-memory"
+DEFAULT_RELEASE_REPO = "kannaka-labs/kannaka-memory"
 
 
 def testbed_env_spec() -> dict[str, Any]:
