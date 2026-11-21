@@ -151,7 +151,7 @@ def catch(a):
 
 
 def seal_ok(rec):
-    """"The seal covers the record as sent: results the catcher added later are set aside first.""""
+    """The seal covers the record as sent: results the catcher added later are set aside first."""
     sent = {k: v for k, v in rec.items() if k != "seal_sha256"}
     sent["targets"] = [{k: t[k] for k in ("horizon", "round", "due")} for t in rec["targets"]]
     body = json.dumps(sent, sort_keys=True, separators=(",", ":"))
